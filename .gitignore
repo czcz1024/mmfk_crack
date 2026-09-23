@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.apk
+*_识别.jpg
+*_解密.jpg
+ScreenShot_*.png
