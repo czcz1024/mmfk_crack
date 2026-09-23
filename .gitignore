@@ -1,6 +1,10 @@
 __pycache__/
 *.pyc
 *.apk
-*_识别.jpg
-*_解密.jpg
+*_识别*.jpg
+*_解密*.jpg
 ScreenShot_*.png
+_debug_*.jpg
+_*.jpg
+_*.png
+_*.py
