@@ -10,13 +10,15 @@
     python watch_phone.py http://192.168.1.8:8080 --pin 1234
 
 画面拉取、识别解密、窗口刷新分成三条线。后台约每 0.5 秒看一眼最新画面：
-不是棋盘就清掉旧叠加；同局已解过就跳过；新开局先丢掉旧解再解密。
-窗口上的「重新识别」或按 R：丢掉当前结果，强制再识别一次（识别错了可手动重试）。
+不是棋盘就清掉旧叠加；同局解出来后粘住结果（同尺寸一律不重算）；
+离开棋盘、过关后空白新盘、或空白盘上新尺寸连续确认后，才自动识别下一局。
+局中乱读成 3/6/8 等尺寸会忽略。手动「重新识别」/R 可强制重算。
 若一次解出多套方案，先当识别错重试；连续 3 次仍是多套，才按真多解显示。
 """
 
 import argparse
 import base64
+import ctypes
 import hashlib
 import http.client
 import json
@@ -38,6 +40,7 @@ from solve_cats import (
     draw_recognition,
     draw_solutions,
     finish_recognize,
+    is_celebration_screen,
     load_font,
     peek_board,
     same_board_colors,
@@ -53,8 +56,39 @@ RECOGNIZE_INTERVAL = 0.5
 FAIL_COOLDOWN = 2.0
 # 多套解法连续出现这么多次，才当真；否则当识别错重试。
 MULTI_CONFIRM = 3
+# 连续多少次看不到棋盘，才丢掉本局结果（避免闪帧误清）。
+LEAVE_CLEAR_TICKS = 4
+# 空白盘上连续多少次读到同一新尺寸，才当真换局（过滤 10→3 闪一下）。
+SIZE_CHANGE_CONFIRM = 3
 # 窗口刷新间隔（毫秒）。
 DISPLAY_MS = 50
+
+# Windows：阻止休眠/熄屏（SetThreadExecutionState）
+_ES_CONTINUOUS = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+_ES_DISPLAY_REQUIRED = 0x00000002
+
+
+def prevent_display_sleep():
+    """运行期间保持屏幕常亮，避免几分钟不动就熄屏。"""
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            _ES_CONTINUOUS | _ES_SYSTEM_REQUIRED | _ES_DISPLAY_REQUIRED
+        )
+    except Exception:
+        pass
+
+
+def allow_display_sleep():
+    """退出时恢复系统默认电源策略。"""
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS)
+    except Exception:
+        pass
 
 
 def random_id(length=16):
@@ -479,10 +513,27 @@ def _clear_bag(bag):
     bag["fail_until"] = 0.0
     bag["announced_n"] = None
     bag["multi_streak"] = 0
+    bag["miss_streak"] = 0
+    bag["size_mismatch_streak"] = 0
+    bag["mismatch_n"] = None
+    bag["saw_celebration"] = False
+    bag["ignore_log_key"] = None
+
+
+def _keep_locked(state, bag, marked=None):
+    if marked is not None:
+        bag["marked"] = marked or bag.get("marked")
+    state.set_result(
+        bag["solutions"],
+        bag["board"],
+        bag["n"],
+        bag["marked"],
+        _title(bag["n"], bag["solutions"], bag["marked"]),
+    )
 
 
 def recognize_loop(state):
-    """漏斗：非棋盘→清叠加；同局已解→跳过；新盘→丢掉旧解再解密；按钮可强制重跑。"""
+    """漏斗：非棋盘→清叠加；同局已解→粘住；只有新盘/手动才重解密。"""
     bag = {
         "solutions": None,
         "board": None,
@@ -493,6 +544,11 @@ def recognize_loop(state):
         "fail_until": 0.0,
         "announced_n": None,
         "multi_streak": 0,
+        "miss_streak": 0,
+        "size_mismatch_streak": 0,
+        "mismatch_n": None,
+        "saw_celebration": False,
+        "ignore_log_key": None,
     }
     last_msg = None
     while state.running():
@@ -510,48 +566,116 @@ def recognize_loop(state):
         if frame is None:
             continue
 
-        peek = peek_board(frame)
+        # 过关动画：不当新局；记下「刚过关」，动画结束后空白新盘再放下旧解。
+        if is_celebration_screen(frame):
+            bag["miss_streak"] = 0
+            if bag["solutions"] is not None:
+                bag["saw_celebration"] = True
+                state.set_status(
+                    _title(bag["n"], bag["solutions"], bag.get("marked"))
+                    + "（过关动画）"
+                )
+            else:
+                state.clear_result("过关动画…")
+            continue
+
+        try:
+            peek = peek_board(frame)
+        except Exception as exc:
+            msg = "peek_board: %s: %s" % (type(exc).__name__, exc)
+            if msg != last_msg:
+                print("识别探测失败: %s" % msg)
+                last_msg = msg
+            continue
+
         if peek is None:
-            # 不是游戏棋盘：旧解一律丢掉，避免粘在微信等界面上。
+            bag["miss_streak"] = int(bag.get("miss_streak") or 0) + 1
+            if bag["solutions"] is not None and bag["miss_streak"] < LEAVE_CLEAR_TICKS:
+                continue
             if bag["solutions"] is not None:
                 print("离开棋盘，放下上次结果")
             _clear_bag(bag)
             state.clear_result("等待棋盘…")
             continue
+        bag["miss_streak"] = 0
 
         if peek.get("target_n") and bag.get("announced_n") != peek["target_n"]:
-            print("进度条读到棋盘 %d×%d" % (peek["target_n"], peek["target_n"]))
-            bag["announced_n"] = peek["target_n"]
+            if bag["solutions"] is None:
+                print("进度条读到棋盘 %d×%d" % (peek["target_n"], peek["target_n"]))
+                bag["announced_n"] = peek["target_n"]
 
         samples = peek["samples"]
         n = peek["n"]
         marked = board_has_marks(frame, peek["board"])
 
-        # 同局且已有解：只更新格子坐标，不再聚类/解密（手动重识别会先清空 bag）。
+        # 过关动画刚结束、又是空白盘 → 新的一局，放下旧解再识别。
         if (
             not force
             and bag["solutions"] is not None
-            and same_board_colors(samples, n, bag["samples"], bag["n"])
+            and bag.get("saw_celebration")
+            and not marked
         ):
-            bag["board"] = peek["board"]
-            bag["samples"] = samples
-            bag["marked"] = marked or bag["marked"]
-            state.set_result(
-                bag["solutions"],
-                bag["board"],
-                bag["n"],
-                bag["marked"],
-                _title(bag["n"], bag["solutions"], bag["marked"]),
-            )
-            continue
-
-        # 新的一局（或第一次 / 手动重跑）：旧结果直接丢掉。
-        if bag["solutions"] is not None:
-            print("检测到新的一局，放下上次结果")
+            print("过关后进入新盘，放下上次结果")
             _clear_bag(bag)
             state.clear_result("识别新的一局…")
+            # bag 已空，下面按新局走
 
-        fail_key = (n, hashlib.md5(np.round(np.asarray(samples) / 12.0).astype(np.int16).tobytes()).hexdigest())
+        # 本局已锁定解：局中粘住；空白新盘才换局。
+        if not force and bag["solutions"] is not None:
+            if n == bag["n"]:
+                bag["size_mismatch_streak"] = 0
+                bag["mismatch_n"] = None
+                same = same_board_colors(samples, n, bag["samples"], bag["n"])
+                if same or marked:
+                    bag["board"] = peek["board"]
+                    if same:
+                        bag["samples"] = samples
+                    _keep_locked(state, bag, marked=marked)
+                    continue
+                # 同尺寸、无标记、颜色明显变了 → 新开局
+                print("同尺寸新开局，放下上次结果")
+                _clear_bag(bag)
+                state.clear_result("识别新的一局…")
+            else:
+                # 尺寸与锁定解不一致
+                if marked:
+                    # 局中乱读成 3/6/8/9：忽略，保持旧解
+                    key = (bag["n"], n)
+                    if bag.get("ignore_log_key") != key:
+                        print(
+                            "忽略尺寸抖动 %d→%d，保持已锁定的 %d×%d"
+                            % (bag["n"], n, bag["n"], bag["n"])
+                        )
+                        bag["ignore_log_key"] = key
+                    bag["size_mismatch_streak"] = 0
+                    bag["mismatch_n"] = None
+                    _keep_locked(state, bag, marked=True)
+                    continue
+                # 空白盘上的新尺寸：连续确认，避免闪一下误换局
+                if bag.get("mismatch_n") != n:
+                    bag["mismatch_n"] = n
+                    bag["size_mismatch_streak"] = 1
+                else:
+                    bag["size_mismatch_streak"] = int(bag.get("size_mismatch_streak") or 0) + 1
+                streak = bag["size_mismatch_streak"]
+                if streak < SIZE_CHANGE_CONFIRM:
+                    print(
+                        "尺寸疑似 %d→%d，确认中 %d/%d"
+                        % (bag["n"], n, streak, SIZE_CHANGE_CONFIRM)
+                    )
+                    _keep_locked(state, bag, marked=False)
+                    continue
+                print("确认新尺寸 %d×%d，放下上次结果" % (n, n))
+                _clear_bag(bag)
+                state.clear_result("识别新的一局…")
+
+        # 局中画面（已有猫/叉）且本局还没锁定解：采样已被污染，再解只会刷无解日志。
+        if not force and marked and bag["solutions"] is None:
+            state.clear_result("局中画面未锁定解，请开局识别或按 R")
+            continue
+
+        # 无解冷却只按尺寸记，避免局中采样抖动换 key 刷屏。
+        fail_key = n
         now = time.time()
         if (
             not force
@@ -638,6 +762,7 @@ def recognize_loop(state):
 
 
 def watch(page_url, pin):
+    prevent_display_sleep()
     state = SharedState()
     stream_thread = threading.Thread(
         target=stream_loop, args=(page_url, pin, state), name="stream", daemon=True
@@ -675,6 +800,7 @@ def watch(page_url, pin):
         viewer.root.mainloop()
     finally:
         state.stop()
+        allow_display_sleep()
 
 
 def main(argv):

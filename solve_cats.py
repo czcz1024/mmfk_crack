@@ -645,7 +645,7 @@ def _cell_is_inactive(sample, bg):
 def prune_ghost_lines(board, side):
     """丢掉明显偏瘦的鬼行/鬼列（间距估小一半时会出现）。"""
     n = len(board)
-    if n < 3:
+    if n < 3 or any(len(row) != n for row in board):
         return board
     keep_cols = [c for c in range(n) if float(np.median([board[r][c][2] for r in range(n)])) >= side * 0.58]
     keep_rows = [r for r in range(n) if float(np.median([board[r][c][3] for c in range(n)])) >= side * 0.58]
@@ -680,26 +680,38 @@ def prune_ghost_lines(board, side):
 
 def trim_inactive_borders(img, board, bg):
     """去掉整行/整列都像背景的边（常见于顶栏被吃进棋盘）。"""
+    if not board or not board[0]:
+        return board
     cells = [list(row) for row in board]
+    width = len(cells[0])
+    if width < 1 or any(len(row) != width for row in cells):
+        return board
     changed = True
-    while changed and len(cells) >= 4:
+    while changed and len(cells) >= 4 and width >= 4:
         changed = False
-        n = len(cells)
-        for row_idx in (0, n - 1):
-            samples = [sample_bgr(img, cells[row_idx][c]) for c in range(n)]
+        height = len(cells)
+        for row_idx in (0, height - 1):
+            if len(cells[row_idx]) != width:
+                return board
+            samples = [sample_bgr(img, cells[row_idx][c]) for c in range(width)]
             inactive = sum(1 for s in samples if _cell_is_inactive(s, bg))
-            if inactive >= max(2, int(math.ceil(n * 0.55))):
+            if inactive >= max(2, int(math.ceil(width * 0.55))):
                 cells = cells[1:] if row_idx == 0 else cells[:-1]
                 changed = True
                 break
         if changed:
             continue
-        n = len(cells)
-        for col_idx in (0, n - 1):
-            samples = [sample_bgr(img, cells[r][col_idx]) for r in range(n)]
+        height = len(cells)
+        for col_idx in (0, width - 1):
+            if any(len(row) <= col_idx for row in cells):
+                return board
+            samples = [sample_bgr(img, cells[r][col_idx]) for r in range(height)]
             inactive = sum(1 for s in samples if _cell_is_inactive(s, bg))
-            if inactive >= max(2, int(math.ceil(n * 0.55))):
+            if inactive >= max(2, int(math.ceil(height * 0.55))):
                 cells = [row[1:] if col_idx == 0 else row[:-1] for row in cells]
+                width = len(cells[0]) if cells else 0
+                if any(len(row) != width for row in cells):
+                    return board
                 changed = True
                 break
     return cells
@@ -957,18 +969,50 @@ def read_board_size_n(img):
         return None
 
 
+def is_celebration_screen(img):
+    """过关动画：半透明暗罩 + 中央花环/彩纸，不能当新棋盘。"""
+    if img is None or img.size == 0:
+        return False
+    h, w = img.shape[:2]
+    if h < 80 or w < 80:
+        return False
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    mean_l = float(gray.mean())
+    # 正常对局画面整体很亮（约 180~210）；过关暗罩通常压到很低。
+    if mean_l >= 120:
+        return False
+    cy0, cy1 = int(h * 0.20), int(h * 0.80)
+    cx0, cx1 = int(w * 0.10), int(w * 0.90)
+    center = img[cy0:cy1, cx0:cx1]
+    hsv = cv2.cvtColor(center, cv2.COLOR_BGR2HSV)
+    dark = cv2.inRange(hsv, (0, 0, 0), (180, 255, 110))
+    dark_ratio = float(cv2.countNonZero(dark)) / float(dark.size)
+    # 暗罩覆盖中央大片；再叠加一点点金/彩也能确认。
+    if mean_l < 100 and dark_ratio > 0.35:
+        return True
+    if mean_l < 130 and dark_ratio > 0.55:
+        return True
+    return False
+
+
 def peek_board(img):
     """轻量探测：画面里有没有完整方阵棋盘。没有则返回 None，不做颜色聚类。"""
+    if is_celebration_screen(img):
+        return None
     work = neutralize_dark_banner(img)
     target_n = read_board_size_n(work)
     bg = estimate_background(work)
     mask = foreground_mask(work)
     squares = find_squares(mask)
-    # 进度 N 与方块数量差太大时，宁可不用进度，避免误读计时器。
+    # 进度 N 与方块数量冲突时：差 1（常见 10 读成 11）且方块数接近完全平方，信格点。
     if target_n is not None and squares:
-        guess = int(round(math.sqrt(len(max(group_by_size(squares), key=len)))))
-        if abs(guess - target_n) >= 3 and guess >= 4:
-            target_n = None
+        group = max(group_by_size(squares), key=len)
+        guess = int(round(math.sqrt(len(group))))
+        if guess >= 4:
+            if abs(guess - target_n) >= 3:
+                target_n = None
+            elif abs(guess - target_n) >= 1 and abs(len(group) - guess * guess) <= guess:
+                target_n = None
     lattice = choose_lattice(squares, prefer_n=target_n)
     if lattice is None and target_n is not None:
         lattice = choose_lattice(squares, prefer_n=None)
