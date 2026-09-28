@@ -13,6 +13,7 @@
 不是棋盘就清掉旧叠加；同局解出来后粘住结果（同尺寸一律不重算）；
 离开棋盘、过关后空白新盘、或空白盘上新尺寸连续确认后，才自动识别下一局。
 局中乱读成 3/6/8 等尺寸会忽略。手动「重新识别」/R 可强制重算。
+「出提示」抓当前这一帧，把分步提示放在画面旁边，一次只显示一步，可左右切换。再点一次关闭。提示图可滚轮缩放、按住拖动。
 若一次解出多套方案，先当识别错重试；连续 3 次仍是多套，才按真多解显示。
 """
 
@@ -35,6 +36,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageTk
 
+import hint_cats
 from solve_cats import (
     board_has_marks,
     draw_recognition,
@@ -392,13 +394,265 @@ class SharedState(object):
             return self.alive
 
 
+class HintPane(object):
+    """旁边的提示图。滚轮缩放，按住左键拖动。"""
+
+    def __init__(self, parent):
+        self.frame = tk.Frame(parent, bg="#14181c")
+        tools = tk.Frame(self.frame, bg="#1e2428")
+        tools.pack(fill=tk.X, side=tk.TOP)
+        for text, command in (
+            ("放大", self.zoom_in),
+            ("缩小", self.zoom_out),
+            ("适应窗口", self.fit),
+        ):
+            tk.Button(
+                tools,
+                text=text,
+                command=command,
+                font=("Microsoft YaHei UI", 10),
+                bg="#2c3338",
+                fg="white",
+                activebackground="#3d454c",
+                activeforeground="white",
+                relief=tk.FLAT,
+                padx=10,
+                pady=4,
+                cursor="hand2",
+            ).pack(side=tk.LEFT, padx=4, pady=4)
+        self.prev_btn = tk.Button(
+            tools,
+            text="上一张",
+            command=self.prev_page,
+            font=("Microsoft YaHei UI", 10),
+            bg="#2c3338",
+            fg="white",
+            activebackground="#3d454c",
+            activeforeground="white",
+            relief=tk.FLAT,
+            padx=10,
+            pady=4,
+            cursor="hand2",
+            state=tk.DISABLED,
+        )
+        self.prev_btn.pack(side=tk.LEFT, padx=(12, 4), pady=4)
+        self.page_label = tk.Label(
+            tools,
+            text="",
+            bg="#1e2428",
+            fg="white",
+            font=("Microsoft YaHei UI", 10),
+        )
+        self.page_label.pack(side=tk.LEFT, padx=4)
+        self.next_btn = tk.Button(
+            tools,
+            text="下一张",
+            command=self.next_page,
+            font=("Microsoft YaHei UI", 10),
+            bg="#2c3338",
+            fg="white",
+            activebackground="#3d454c",
+            activeforeground="white",
+            relief=tk.FLAT,
+            padx=10,
+            pady=4,
+            cursor="hand2",
+            state=tk.DISABLED,
+        )
+        self.next_btn.pack(side=tk.LEFT, padx=4, pady=4)
+        tk.Label(
+            tools,
+            text="滚轮缩放，按住拖动",
+            bg="#1e2428",
+            fg="#c8c8c8",
+            font=("Microsoft YaHei UI", 10),
+        ).pack(side=tk.LEFT, padx=8)
+
+        self.canvas = tk.Canvas(self.frame, bg="#14181c", highlightthickness=0, width=720, height=640)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.pages = []
+        self.index = 0
+        self.pil = None
+        self.photo = None
+        self.scale = 1.0
+        self.off_x = 0.0
+        self.off_y = 0.0
+        self._need_fit = False
+        self._drag = None
+        self.canvas.bind("<Configure>", self._on_configure)
+        self.canvas.bind("<MouseWheel>", self._on_wheel)
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", lambda _event: self._end_drag())
+        self.canvas.configure(cursor="hand2")
+
+    def set_pages(self, pages):
+        self.pages = list(pages)
+        self.index = 0
+        self._update_nav()
+        if self.pages:
+            self._show_index(0)
+
+    def prev_page(self):
+        if self.index <= 0:
+            return
+        self._show_index(self.index - 1)
+
+    def next_page(self):
+        if self.index + 1 >= len(self.pages):
+            return
+        self._show_index(self.index + 1)
+
+    def _show_index(self, index):
+        self.index = index
+        self._update_nav()
+        self._set_pil(self.pages[index])
+
+    def _update_nav(self):
+        count = len(self.pages)
+        if count == 0:
+            self.page_label.configure(text="")
+            self.prev_btn.configure(state=tk.DISABLED)
+            self.next_btn.configure(state=tk.DISABLED)
+            return
+        self.page_label.configure(text="%d / %d" % (self.index + 1, count))
+        self.prev_btn.configure(state=tk.NORMAL if self.index > 0 else tk.DISABLED)
+        self.next_btn.configure(state=tk.NORMAL if self.index + 1 < count else tk.DISABLED)
+
+    def _set_pil(self, pil_image):
+        self.pil = pil_image
+        self._need_fit = True
+        self._drag = None
+        if self.canvas.winfo_width() > 20 and self.canvas.winfo_height() > 20:
+            self.fit()
+        else:
+            self.canvas.after(30, self._fit_when_ready)
+
+    def show_message(self, text):
+        self.pages = []
+        self.index = 0
+        self._update_nav()
+        self.pil = None
+        self.photo = None
+        self.canvas.delete("hint")
+        self.canvas.delete("msg")
+        self.canvas.create_text(
+            24,
+            24,
+            text=text,
+            anchor=tk.NW,
+            fill="white",
+            font=("Microsoft YaHei UI", 14),
+            width=640,
+            tags="msg",
+        )
+
+    def _fit_when_ready(self):
+        if self.pil is None or not self._need_fit:
+            return
+        if self.canvas.winfo_width() <= 20:
+            self.canvas.after(30, self._fit_when_ready)
+            return
+        self.fit()
+
+    def fit(self):
+        if self.pil is None:
+            return
+        cw = max(1, self.canvas.winfo_width())
+        ch = max(1, self.canvas.winfo_height())
+        self.scale = min(cw / float(self.pil.width), ch / float(self.pil.height))
+        self.off_x = (cw - self.pil.width * self.scale) / 2.0
+        self.off_y = (ch - self.pil.height * self.scale) / 2.0
+        self._need_fit = False
+        self._redraw()
+
+    def zoom_in(self):
+        self._zoom_at(1.2, self.canvas.winfo_width() / 2.0, self.canvas.winfo_height() / 2.0)
+
+    def zoom_out(self):
+        self._zoom_at(1.0 / 1.2, self.canvas.winfo_width() / 2.0, self.canvas.winfo_height() / 2.0)
+
+    def _on_configure(self, event):
+        if self._need_fit and event.width > 20 and event.height > 20:
+            self.fit()
+
+    def _on_wheel(self, event):
+        if self.pil is None or event.delta == 0:
+            return
+        factor = 1.12 if event.delta > 0 else (1.0 / 1.12)
+        self._zoom_at(factor, event.x, event.y)
+
+    def _zoom_at(self, factor, cx, cy):
+        if self.pil is None:
+            return
+        new_scale = min(8.0, max(0.05, self.scale * factor))
+        ix = (cx - self.off_x) / self.scale
+        iy = (cy - self.off_y) / self.scale
+        self.scale = new_scale
+        self.off_x = cx - ix * self.scale
+        self.off_y = cy - iy * self.scale
+        self._need_fit = False
+        self._redraw()
+
+    def _on_press(self, event):
+        self._drag = (event.x, event.y, self.off_x, self.off_y)
+        self.canvas.configure(cursor="fleur")
+
+    def _on_drag(self, event):
+        if self._drag is None or self.pil is None:
+            return
+        x0, y0, ox, oy = self._drag
+        self.off_x = ox + (event.x - x0)
+        self.off_y = oy + (event.y - y0)
+        self._redraw()
+
+    def _end_drag(self):
+        self._drag = None
+        self.canvas.configure(cursor="hand2")
+
+    def _redraw(self):
+        if self.pil is None:
+            return
+        cw = max(1, self.canvas.winfo_width())
+        ch = max(1, self.canvas.winfo_height())
+        x0 = max(0, int((-self.off_x) / self.scale))
+        y0 = max(0, int((-self.off_y) / self.scale))
+        x1 = min(self.pil.width, int((cw - self.off_x) / self.scale) + 1)
+        y1 = min(self.pil.height, int((ch - self.off_y) / self.scale) + 1)
+        if x1 <= x0 or y1 <= y0:
+            self.canvas.delete("hint")
+            return
+        crop = self.pil.crop((x0, y0, x1, y1))
+        dw = max(1, int(round((x1 - x0) * self.scale)))
+        dh = max(1, int(round((y1 - y0) * self.scale)))
+        shown = crop.resize((dw, dh), Image.BILINEAR)
+        self.photo = ImageTk.PhotoImage(shown)
+        px = self.off_x + x0 * self.scale
+        py = self.off_y + y0 * self.scale
+        self.canvas.delete("hint")
+        self.canvas.delete("msg")
+        self.canvas.create_image(px, py, anchor=tk.NW, image=self.photo, tags="hint")
+
+
+def make_hint_pages(frame):
+    found = hint_cats.recognize_board(frame)
+    steps, _final, problem = hint_cats.deduce(found["labels"], found["marks"], found["names"])
+    if not steps:
+        if problem:
+            raise RuntimeError("标记有矛盾：%s" % problem)
+        raise RuntimeError("这一步没有能直接确定的新格子")
+    return hint_cats.render_steps(found["img"], found["board"], steps)
+
+
 class Viewer(object):
-    def __init__(self, on_rerecognize=None):
+    def __init__(self, on_rerecognize=None, on_hint=None):
         self.root = tk.Tk()
         self.root.title(WINDOW)
         self.closed = False
         self.photo = None
         self.on_rerecognize = on_rerecognize
+        self.on_hint = on_hint
+        self.hint_visible = False
 
         bar = tk.Frame(self.root, bg="#1e2428")
         bar.pack(fill=tk.X, side=tk.TOP)
@@ -417,21 +671,104 @@ class Viewer(object):
             cursor="hand2",
         )
         self.rerecognize_btn.pack(side=tk.LEFT, padx=8, pady=6)
+        self.hint_btn = tk.Button(
+            bar,
+            text="出提示",
+            command=self._click_hint,
+            font=("Microsoft YaHei UI", 11),
+            bg="#e23b45",
+            fg="white",
+            activebackground="#c42d36",
+            activeforeground="white",
+            relief=tk.FLAT,
+            padx=14,
+            pady=6,
+            cursor="hand2",
+        )
+        self.hint_btn.pack(side=tk.LEFT, padx=4, pady=6)
 
-        self.label = tk.Label(self.root, bg="black")
-        self.label.pack()
+        self.body = tk.Frame(self.root, bg="black")
+        self.body.pack(fill=tk.BOTH, expand=True)
+        self.label = tk.Label(self.body, bg="black")
+        self.label.pack(side=tk.LEFT)
+        self.hint_pane = HintPane(self.body)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.bind("<Escape>", lambda _event: self.close())
         self.root.bind("<q>", lambda _event: self.close())
         self.root.bind("<Q>", lambda _event: self.close())
         self.root.bind("<r>", lambda _event: self._click_rerecognize())
         self.root.bind("<R>", lambda _event: self._click_rerecognize())
+        self.root.bind("<Left>", lambda _event: self.hint_pane.prev_page())
+        self.root.bind("<Right>", lambda _event: self.hint_pane.next_page())
 
     def _click_rerecognize(self):
         if self.closed:
             return
         if self.on_rerecognize is not None:
             self.on_rerecognize()
+
+    def _click_hint(self):
+        if self.closed or self.on_hint is None:
+            return
+        if self.hint_visible:
+            self.hide_hint()
+            return
+        self.hint_btn.configure(state=tk.DISABLED, text="正在出提示…")
+        self.on_hint()
+
+    def hint_finished(self):
+        if self.closed:
+            return
+        try:
+            text = "关闭提示" if self.hint_visible else "出提示"
+            self.hint_btn.configure(state=tk.NORMAL, text=text)
+        except tk.TclError:
+            pass
+
+    def show_hint_pages(self, pages):
+        if self.closed:
+            return
+        self._ensure_hint_column()
+        self.hint_pane.set_pages(pages)
+
+    def hide_hint(self):
+        if self.closed or not self.hint_visible:
+            return
+        self.hint_pane.frame.pack_forget()
+        self.hint_visible = False
+        self.hint_pane.pages = []
+        self.hint_pane.index = 0
+        self.hint_pane._update_nav()
+        geom = getattr(self, "_geom_before", None)
+        if geom:
+            self.root.geometry(geom)
+        try:
+            self.hint_btn.configure(state=tk.NORMAL, text="出提示")
+        except tk.TclError:
+            pass
+
+    def show_hint_message(self, text):
+        if self.closed:
+            return
+        self._ensure_hint_column()
+        self.hint_pane.show_message(text)
+
+    def _ensure_hint_column(self):
+        if self.hint_visible:
+            return
+        self._geom_before = self.root.geometry()
+        self.hint_pane.frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.hint_visible = True
+        self.root.update_idletasks()
+        cur_w = max(self.root.winfo_width(), 360)
+        cur_h = max(self.root.winfo_height(), 640)
+        screen_w = int(ctypes.windll.user32.GetSystemMetrics(0)) if sys.platform == "win32" else 1600
+        target = min(screen_w - 16, cur_w + 780)
+        x = self.root.winfo_x()
+        y = self.root.winfo_y()
+        if x + target > screen_w:
+            x = max(0, screen_w - target - 8)
+        self.root.geometry("%dx%d+%d+%d" % (target, cur_h, x, y))
 
     def close(self):
         self.closed = True
@@ -773,7 +1110,38 @@ def watch(page_url, pin):
     stream_thread.start()
     recog_thread.start()
 
-    viewer = Viewer(on_rerecognize=state.request_rerecognize)
+    def request_hint():
+        frame, _digest = state.get_frame_snapshot()
+        if frame is None:
+            viewer.hint_finished()
+            viewer.show_hint_message("还没有画面，等连上手机后再试。")
+            return
+
+        def work():
+            error = None
+            pages = None
+            try:
+                pages = make_hint_pages(frame)
+            except Exception as exc:
+                error = str(exc)
+
+            def apply():
+                if viewer.closed:
+                    return
+                if pages:
+                    viewer.show_hint_pages(pages)
+                else:
+                    viewer.show_hint_message(error or "出提示失败")
+                viewer.hint_finished()
+
+            try:
+                viewer.root.after(0, apply)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=work, name="hint", daemon=True).start()
+
+    viewer = Viewer(on_rerecognize=state.request_rerecognize, on_hint=request_hint)
     blank = paint_status(np.full((640, 360, 3), 32, np.uint8), "正在连接手机…")
     viewer.show(blank)
 
