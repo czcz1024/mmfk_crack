@@ -14,6 +14,7 @@
 离开棋盘、过关后空白新盘、或空白盘上新尺寸连续确认后，才自动识别下一局。
 局中乱读成 3/6/8 等尺寸会忽略。手动「重新识别」/R 可强制重算。
 「出提示」抓当前这一帧，把分步提示放在画面旁边，一次只显示一步，可左右切换。再点一次关闭。提示图可滚轮缩放、按住拖动。
+「自动点击」用 adb 按当前方案逐格点到手机上。点出猫就继续，点出叉就排除这一格、重新解密，再点新方案。再点一次按钮停止。
 若一次解出多套方案，先当识别错重试；连续 3 次仍是多套，才按真多解显示。
 """
 
@@ -24,7 +25,9 @@ import hashlib
 import http.client
 import json
 import os
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -318,8 +321,13 @@ class SharedState(object):
         self.board = None
         self.n = None
         self.marked = False
+        self.labels = None
+        self.note = ""
+        self.adopt_solutions = None
         self.alive = True
         self.force_rerecognize = False
+        self.play_running = False
+        self.play_stop = threading.Event()
 
     def set_frame(self, frame, digest):
         with self.lock:
@@ -350,16 +358,95 @@ class SharedState(object):
             self.board = None
             self.n = None
             self.marked = False
+            self.labels = None
+            self.note = ""
+            self.adopt_solutions = None
             self.status = status
+
+    def set_labels(self, labels):
+        with self.lock:
+            self.labels = None if labels is None else np.array(labels, copy=True)
+
+    def set_note(self, text):
+        with self.lock:
+            self.note = text or ""
+            if self.solutions is not None and self.n is not None:
+                title = _title(self.n, self.solutions, self.marked)
+                self.status = ("%s｜%s" % (title, self.note)) if self.note else title
+
+    def get_note(self):
+        with self.lock:
+            return self.note
+
+    def publish_solutions(self, solutions, board, n, marked, labels):
+        """自动点击重解后，立刻换上新方案，并让识别线程跟着改。"""
+        with self.lock:
+            self.solutions = list(solutions)
+            self.board = board
+            self.n = n
+            self.marked = marked
+            self.labels = None if labels is None else np.array(labels, copy=True)
+            self.adopt_solutions = list(solutions)
+            title = _title(n, self.solutions, marked)
+            self.status = ("%s｜%s" % (title, self.note)) if self.note else title
+
+    def take_adopt_solution(self):
+        with self.lock:
+            solutions = self.adopt_solutions
+            self.adopt_solutions = None
+            return solutions
+
+    def has_solution(self):
+        with self.lock:
+            return self.solutions is not None and self.board is not None
+
+    def play_is_running(self):
+        with self.lock:
+            return self.play_running
+
+    def begin_play(self):
+        with self.lock:
+            if self.play_running:
+                return False
+            self.play_running = True
+            self.play_stop.clear()
+            return True
+
+    def end_play(self):
+        with self.lock:
+            self.play_running = False
+
+    def request_play_stop(self):
+        self.play_stop.set()
+
+    def play_should_stop(self):
+        return self.play_stop.is_set() or not self.running()
+
+    def get_play_pack(self):
+        with self.lock:
+            if self.frame is None or self.solutions is None or self.board is None or self.labels is None:
+                return None
+            return {
+                "frame": self.frame.copy(),
+                "board": self.board,
+                "labels": self.labels.copy(),
+                "n": self.n,
+                "marked": self.marked,
+                "solutions": list(self.solutions),
+            }
 
     def request_rerecognize(self):
         """界面按钮：立刻清掉叠加，并让识别线程强制重跑。"""
+        self.play_stop.set()
         with self.lock:
             self.force_rerecognize = True
             self.solutions = None
             self.board = None
             self.n = None
             self.marked = False
+            self.labels = None
+            self.note = ""
+            self.adopt_solutions = None
             self.status = "手动重新识别…"
 
     def consume_rerecognize(self):
@@ -645,13 +732,14 @@ def make_hint_pages(frame):
 
 
 class Viewer(object):
-    def __init__(self, on_rerecognize=None, on_hint=None):
+    def __init__(self, on_rerecognize=None, on_hint=None, on_play=None):
         self.root = tk.Tk()
         self.root.title(WINDOW)
         self.closed = False
         self.photo = None
         self.on_rerecognize = on_rerecognize
         self.on_hint = on_hint
+        self.on_play = on_play
         self.hint_visible = False
 
         bar = tk.Frame(self.root, bg="#1e2428")
@@ -686,6 +774,21 @@ class Viewer(object):
             cursor="hand2",
         )
         self.hint_btn.pack(side=tk.LEFT, padx=4, pady=6)
+        self.play_btn = tk.Button(
+            bar,
+            text="自动点击",
+            command=self._click_play,
+            font=("Microsoft YaHei UI", 11),
+            bg="#1f8a4c",
+            fg="white",
+            activebackground="#18723e",
+            activeforeground="white",
+            relief=tk.FLAT,
+            padx=14,
+            pady=6,
+            cursor="hand2",
+        )
+        self.play_btn.pack(side=tk.LEFT, padx=4, pady=6)
 
         self.body = tk.Frame(self.root, bg="black")
         self.body.pack(fill=tk.BOTH, expand=True)
@@ -706,6 +809,25 @@ class Viewer(object):
             return
         if self.on_rerecognize is not None:
             self.on_rerecognize()
+
+    def _click_play(self):
+        if self.closed or self.on_play is None:
+            return
+        self.on_play()
+
+    def set_play_text(self, text):
+        def apply():
+            if self.closed:
+                return
+            try:
+                self.play_btn.configure(text=text, state=tk.NORMAL)
+            except tk.TclError:
+                pass
+
+        try:
+            self.root.after(0, apply)
+        except tk.TclError:
+            pass
 
     def _click_hint(self):
         if self.closed or self.on_hint is None:
@@ -857,6 +979,14 @@ def _clear_bag(bag):
     bag["ignore_log_key"] = None
 
 
+def _status_with_note(state, n, solutions, marked):
+    title = _title(n, solutions, marked)
+    note = state.get_note()
+    if note:
+        return "%s｜%s" % (title, note)
+    return title
+
+
 def _keep_locked(state, bag, marked=None):
     if marked is not None:
         bag["marked"] = marked or bag.get("marked")
@@ -865,7 +995,7 @@ def _keep_locked(state, bag, marked=None):
         bag["board"],
         bag["n"],
         bag["marked"],
-        _title(bag["n"], bag["solutions"], bag["marked"]),
+        _status_with_note(state, bag["n"], bag["solutions"], bag["marked"]),
     )
 
 
@@ -898,6 +1028,9 @@ def recognize_loop(state):
             print("手动触发重新识别")
             _clear_bag(bag)
             state.clear_result("手动重新识别…")
+        adopted = state.take_adopt_solution()
+        if adopted and not force and bag["solutions"] is not None:
+            bag["solutions"] = adopted
 
         frame, _digest = state.get_frame_snapshot()
         if frame is None:
@@ -1089,16 +1222,350 @@ def recognize_loop(state):
         last_msg = None
         extra = "，还有更多套" if truncated else ""
         print("%s %d×%d，%d 套方案%s" % (stage, n, n, len(solutions), extra))
+        state.set_labels(found["labels"])
         state.set_result(
             solutions,
             found["board"],
             n,
             marked,
-            _title(n, solutions, marked),
+            _status_with_note(state, n, solutions, marked),
         )
 
 
-def watch(page_url, pin):
+def _adb_run(adb, args, timeout):
+    command = [adb] + list(args)
+    kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "timeout": timeout,
+        "check": False,
+    }
+    if sys.platform == "win32":
+        kwargs["creationflags"] = 0x08000000
+    try:
+        result = subprocess.run(command, **kwargs)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("adb 超时")
+    except OSError as exc:
+        raise RuntimeError("adb 启动失败：%s" % exc)
+    out = (result.stdout or b"").decode("utf-8", "replace").strip()
+    err = (result.stderr or b"").decode("utf-8", "replace").strip()
+    return result.returncode, out, err
+
+
+def find_adb():
+    bundled = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "platform-tools", "adb.exe")
+    if os.path.isfile(bundled):
+        return bundled
+    found = shutil.which("adb")
+    if found:
+        return found
+    roots = [
+        os.environ.get("ANDROID_HOME", ""),
+        os.environ.get("ANDROID_SDK_ROOT", ""),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Android", "Sdk"),
+    ]
+    for root in roots:
+        if not root:
+            continue
+        path = os.path.join(root, "platform-tools", "adb.exe")
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _adb_devices(adb):
+    code, out, err = _adb_run(adb, ["devices"], 8)
+    if code != 0:
+        raise RuntimeError(err or out or "adb devices 失败")
+    online = []
+    unauthorized = False
+    for line in out.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        if parts[1] == "device":
+            online.append(parts[0])
+        elif parts[1] == "unauthorized":
+            unauthorized = True
+    return online, unauthorized
+
+
+def _read_screen_size(adb, serial):
+    code, out, err = _adb_run(adb, ["-s", serial, "shell", "wm", "size"], 8)
+    if code != 0:
+        raise RuntimeError(err or out or "读不到手机分辨率")
+    sizes = []
+    for line in out.splitlines():
+        if ":" not in line or "x" not in line.lower():
+            continue
+        tail = line.split(":", 1)[1]
+        chunks = tail.replace("X", "x").split("x")
+        if len(chunks) != 2:
+            continue
+        try:
+            sizes.append((int(chunks[0].strip()), int(chunks[1].strip())))
+        except ValueError:
+            continue
+    if not sizes:
+        raise RuntimeError("读不到手机分辨率：%s" % out)
+    return sizes[-1]
+
+
+def connect_adb(preferred, phone_host):
+    """连上已经配对好的 adb。ScreenStream 本身不能把点击送回手机。"""
+    adb = find_adb()
+    if not adb:
+        raise RuntimeError("找不到 adb，请安装 platform-tools")
+    serial = (preferred or "").strip()
+    if serial:
+        host, _sep, port = serial.rpartition(":")
+        if host and "." in host and port.isdigit():
+            code, out, err = _adb_run(adb, ["connect", serial], 12)
+            text = "%s %s" % (out, err)
+            lower = text.lower()
+            failed = "fail" in lower or "cannot" in lower or "unable" in lower or "refused" in lower
+            if code != 0 or failed or "connected" not in lower:
+                raise RuntimeError("adb 连不上 %s" % serial)
+        return adb, serial, _read_screen_size(adb, serial)
+    online, unauthorized = _adb_devices(adb)
+    if not online and phone_host:
+        _adb_run(adb, ["connect", "%s:5555" % phone_host], 12)
+        online, unauthorized = _adb_devices(adb)
+    if not online:
+        if unauthorized:
+            raise RuntimeError("请在手机上允许 USB 调试")
+        raise RuntimeError("没有 adb 设备，请先 adb connect")
+    if phone_host:
+        for item in online:
+            if item.startswith(phone_host):
+                serial = item
+                break
+    if not serial:
+        serial = online[0]
+    return adb, serial, _read_screen_size(adb, serial)
+
+
+def orient_screen(frame_w, frame_h, device_w, device_h):
+    """画面和 wm size 的方向不一致时，对调宽高，让点击轴和画面对齐。"""
+    if frame_w <= 0 or frame_h <= 0 or device_w <= 0 or device_h <= 0:
+        return device_w, device_h
+    direct = abs((frame_w / float(frame_h)) - (device_w / float(device_h)))
+    swapped = abs((frame_w / float(frame_h)) - (device_h / float(device_w)))
+    if swapped + 0.05 < direct:
+        return device_h, device_w
+    return device_w, device_h
+
+
+def cell_center_tap(frame_shape, box, screen_wh):
+    frame_h, frame_w = frame_shape[:2]
+    device_w, device_h = orient_screen(frame_w, frame_h, screen_wh[0], screen_wh[1])
+    x, y, w, h = box
+    tx = int(round((x + w / 2.0) * device_w / float(frame_w)))
+    ty = int(round((y + h / 2.0) * device_h / float(frame_h)))
+    tx = max(0, min(device_w - 1, tx))
+    ty = max(0, min(device_h - 1, ty))
+    return tx, ty, device_w, device_h
+
+
+def _cell_kind(frame, board, row, col):
+    if frame is None or board is None:
+        return None
+    if row >= len(board) or col >= len(board[row]):
+        return None
+    kind, _color = hint_cats.classify_cell(frame, board[row][col])
+    return kind
+
+
+def _marks_on_board(frame, board):
+    confirmed = set()
+    banned = set()
+    for row, line in enumerate(board):
+        for col in range(len(line)):
+            kind = _cell_kind(frame, board, row, col)
+            if kind == hint_cats.CAT:
+                confirmed.add((row, col))
+            elif kind == hint_cats.EX:
+                banned.add((row, col))
+    return confirmed, banned
+
+
+def _solution_conflicts(solution, confirmed, banned):
+    cells = set(tuple(cell) for cell in solution)
+    if confirmed - cells:
+        return True
+    if cells & banned:
+        return True
+    return False
+
+
+def _reread_labels(frame):
+    peek = peek_board(frame)
+    if peek is None:
+        return None
+    return finish_recognize(peek)
+
+
+def _resolve_after_miss(state, frame, labels, board, n, marked, confirmed, banned):
+    solutions, _truncated = solve_all(labels, forced=confirmed, banned=banned)
+    if not solutions:
+        try:
+            found = _reread_labels(frame)
+        except Exception as exc:
+            print("重新识别失败: %s" % exc)
+            found = None
+        if found is not None and found["n"] == n:
+            labels = found["labels"]
+            board = found["board"]
+            solutions, _truncated = solve_all(labels, forced=confirmed, banned=banned)
+        elif found is not None and found["n"] != n:
+            state.set_note("棋盘变了，已停止")
+            return None
+    if not solutions:
+        state.set_note("重新解密后无解，已停止")
+        return None
+    state.set_note("已重新解密")
+    state.publish_solutions(solutions, board, n, marked, labels)
+    print("重新解密：%d 套方案" % len(solutions))
+    return list(solutions[0]), labels, board
+
+
+def _wait_cell(state, row, col, timeout):
+    """等这一格变成猫或叉。白闪一下再变成猫，仍算点对。"""
+    deadline = time.time() + timeout
+    time.sleep(0.35)
+    saw_cat = 0
+    saw_ex = 0
+    while time.time() < deadline and not state.play_should_stop():
+        pack = state.get_play_pack()
+        frame = None if pack is None else pack["frame"]
+        board = None if pack is None else pack["board"]
+        kind = _cell_kind(frame, board, row, col)
+        if kind == hint_cats.CAT:
+            saw_cat += 1
+            if saw_cat >= 2:
+                return hint_cats.CAT
+        elif kind == hint_cats.EX:
+            saw_ex += 1
+            saw_cat = 0
+        else:
+            saw_cat = 0
+        time.sleep(0.12)
+    if saw_cat >= 1:
+        return hint_cats.CAT
+    if saw_ex >= 2:
+        return hint_cats.EX
+    return hint_cats.EMPTY
+
+
+def play_loop(state, viewer, page_url, adb_serial):
+    try:
+        parsed = urlparse(page_url)
+        state.set_note("正在连接点击…")
+        adb, serial, screen = connect_adb(adb_serial, parsed.hostname)
+        pack = state.get_play_pack()
+        if pack is None or not pack["solutions"]:
+            state.set_note("请先重新识别")
+            return
+        solution = [tuple(cell) for cell in pack["solutions"][0]]
+        labels = pack["labels"]
+        print(
+            "自动点击：%s，屏幕 %d×%d，先点第 1 套，共 %d 套"
+            % (serial, screen[0], screen[1], len(pack["solutions"]))
+        )
+        if len(pack["solutions"]) > 1:
+            state.set_note("有多套，先点第1套")
+        must_resolve = False
+        empty_tries = 0
+        last_cell = None
+        wrong_rounds = 0
+        extra_banned = set()
+        accepted = set()
+        while not state.play_should_stop():
+            pack = state.get_play_pack()
+            if pack is None:
+                state.set_note("没有解密结果，已停止")
+                return
+            frame = pack["frame"]
+            board = pack["board"]
+            n = pack["n"]
+            marked = pack["marked"]
+            confirmed, banned = _marks_on_board(frame, board)
+            confirmed = confirmed | accepted
+            banned = banned | extra_banned
+            if must_resolve or _solution_conflicts(solution, confirmed, banned):
+                resolved = _resolve_after_miss(
+                    state, frame, labels, board, n, marked, confirmed, banned
+                )
+                if resolved is None:
+                    return
+                solution, labels, board = resolved
+                must_resolve = False
+                continue
+            pending = [cell for cell in solution if cell not in confirmed]
+            if not pending:
+                state.set_note("已点完")
+                print("自动点击：已点完")
+                return
+            row, col = pending[0]
+            if (row, col) in banned:
+                must_resolve = True
+                continue
+            if (row, col) != last_cell:
+                empty_tries = 0
+                last_cell = (row, col)
+            box = board[row][col]
+            tx, ty, device_w, device_h = cell_center_tap(frame.shape, box, screen)
+            state.set_note("正在点 %d/%d" % (len(confirmed) + 1, n))
+            print(
+                "点击第 %d 行第 %d 列，画面 %dx%d → 手机 (%d,%d)，屏幕 %dx%d"
+                % (row + 1, col + 1, frame.shape[1], frame.shape[0], tx, ty, device_w, device_h)
+            )
+            code, out, err = _adb_run(adb, ["-s", serial, "shell", "input", "tap", str(tx), str(ty)], 8)
+            if code != 0:
+                detail = (err or out or "点击失败")[:40]
+                print("adb tap 失败: %s" % detail)
+                state.set_note("点击失败，请允许模拟点击")
+                return
+            kind = _wait_cell(state, row, col, 2.6)
+            if state.play_should_stop():
+                break
+            if kind == hint_cats.CAT:
+                empty_tries = 0
+                accepted.add((row, col))
+                state.set_note("这一格正确")
+                print("第 %d 行第 %d 列是猫" % (row + 1, col + 1))
+                time.sleep(0.25)
+                continue
+            if kind == hint_cats.EX:
+                empty_tries = 0
+                wrong_rounds += 1
+                extra_banned.add((row, col))
+                print("第 %d 行第 %d 列是叉，准备重新解密" % (row + 1, col + 1))
+                if wrong_rounds > n + 2:
+                    state.set_note("多次点错，已停止")
+                    return
+                must_resolve = True
+                state.set_note("这一格不是猫，重新解密")
+                continue
+            empty_tries += 1
+            print("第 %d 行第 %d 列没有变化，第 %d 次" % (row + 1, col + 1, empty_tries))
+            if empty_tries > 2:
+                state.set_note("没点到格子，已停止")
+                print("连续没点中。请确认无线调试，以及「USB调试（安全设置）」已打开。")
+                return
+            state.set_note("没点中，再试一次")
+        if state.has_solution() and state.running():
+            state.set_note("已停止")
+    except Exception as exc:
+        print("自动点击失败: %s" % exc)
+        state.set_note(str(exc)[:36])
+    finally:
+        state.end_play()
+        viewer.set_play_text("自动点击")
+
+
+def watch(page_url, pin, adb_serial=""):
     prevent_display_sleep()
     state = SharedState()
     stream_thread = threading.Thread(
@@ -1141,7 +1608,40 @@ def watch(page_url, pin):
 
         threading.Thread(target=work, name="hint", daemon=True).start()
 
-    viewer = Viewer(on_rerecognize=state.request_rerecognize, on_hint=request_hint)
+    def toggle_play():
+        if state.play_is_running():
+            state.request_play_stop()
+            viewer.set_play_text("正在停止…")
+            return
+        if not state.has_solution():
+            print("自动点击：还没有解密结果")
+            state.set_status("还没有解密结果")
+            viewer.set_play_text("还没解密")
+
+            def restore_play_text():
+                if not state.play_is_running():
+                    viewer.set_play_text("自动点击")
+
+            try:
+                viewer.root.after(1500, restore_play_text)
+            except tk.TclError:
+                pass
+            return
+        if not state.begin_play():
+            return
+        viewer.set_play_text("停止点击")
+        threading.Thread(
+            target=play_loop,
+            args=(state, viewer, page_url, adb_serial),
+            name="play",
+            daemon=True,
+        ).start()
+
+    viewer = Viewer(
+        on_rerecognize=state.request_rerecognize,
+        on_hint=request_hint,
+        on_play=toggle_play,
+    )
     blank = paint_status(np.full((640, 360, 3), 32, np.uint8), "正在连接手机…")
     viewer.show(blank)
 
@@ -1176,8 +1676,9 @@ def main(argv):
     parser = argparse.ArgumentParser(description="从手机画面自动解密猫猫方块")
     parser.add_argument("url", help="ScreenStream 显示的地址，例如 http://192.168.1.8:8080")
     parser.add_argument("--pin", default="", help="ScreenStream 里设置的数字密码")
+    parser.add_argument("--adb", default="", help="adb 序列号或 IP:端口，例如 192.168.1.8:5555")
     args = parser.parse_args(argv[1:])
-    watch(args.url, args.pin.strip())
+    watch(args.url, args.pin.strip(), args.adb.strip())
     return 0
 
 

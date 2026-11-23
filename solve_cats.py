@@ -1122,11 +1122,40 @@ def recognize(path):
     return recognize_bgr(load_bgr(path))
 
 
-def solve_all(labels):
-    """找出所有满足规则的摆法。超过 MAX_SCHEMES 套时停止，并标明没有列全。"""
+def solve_all(labels, forced=None, banned=None):
+    """找出所有满足规则的摆法。超过 MAX_SCHEMES 套时停止，并标明没有列全。
+
+    forced: 已经确定是猫的格子。banned: 不能再放猫的格子。
+    不传这两个参数时，和原来一样只按颜色规则搜。
+    """
     n = int(labels.shape[0])
+    forced_at = {}
+    if forced:
+        for row, col in forced:
+            row = int(row)
+            col = int(col)
+            if forced_at.get(row, col) != col:
+                return [], False
+            forced_at[row] = col
+    banned_set = set()
+    if banned:
+        banned_set = set((int(row), int(col)) for row, col in banned)
     solutions = []
     truncated = False
+
+    def can_place(row, col, used_cols, used_colors, prev_col):
+        if not (0 <= row < n and 0 <= col < n):
+            return False
+        if (row, col) in banned_set:
+            return False
+        if used_cols & (1 << col):
+            return False
+        if prev_col is not None and abs(col - prev_col) <= 1:
+            return False
+        color = int(labels[row, col])
+        if used_colors & (1 << color):
+            return False
+        return True
 
     def search(row, used_cols, used_colors, prev_col, path):
         nonlocal truncated
@@ -1138,15 +1167,19 @@ def solve_all(labels):
                 solutions.pop()
                 truncated = True
             return
+        if row in forced_at:
+            col = forced_at[row]
+            if can_place(row, col, used_cols, used_colors, prev_col):
+                path.append((row, col))
+                color = int(labels[row, col])
+                search(row + 1, used_cols | (1 << col), used_colors | (1 << color), col, path)
+                path.pop()
+            return
         for col in range(n):
-            if used_cols & (1 << col):
-                continue
-            if prev_col is not None and abs(col - prev_col) <= 1:
-                continue
-            color = int(labels[row, col])
-            if used_colors & (1 << color):
+            if not can_place(row, col, used_cols, used_colors, prev_col):
                 continue
             path.append((row, col))
+            color = int(labels[row, col])
             search(row + 1, used_cols | (1 << col), used_colors | (1 << color), col, path)
             path.pop()
 
