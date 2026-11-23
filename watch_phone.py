@@ -14,7 +14,8 @@
 离开棋盘、过关后空白新盘、或空白盘上新尺寸连续确认后，才自动识别下一局。
 局中乱读成 3/6/8 等尺寸会忽略。手动「重新识别」/R 可强制重算。
 「出提示」抓当前这一帧，把分步提示放在画面旁边，一次只显示一步，可左右切换。再点一次关闭。提示图可滚轮缩放、按住拖动。
-「自动点击」用 adb 按当前方案逐格点到手机上。点出猫就继续，点出叉就排除这一格、重新解密，再点新方案。再点一次按钮停止。
+启动后如果还没有 adb 配对，会先弹出配对框，不进入游戏画面。填手机上的 IP、配对端口和配对码即可；也可以选择只看、不自动点击。
+「自动点击」用 adb 按当前方案逐格双击到手机上。单击会被游戏标成「不是猫」。点出猫就继续，点出叉就排除这一格、重新解密，再点新方案。再点一次按钮停止。
 若一次解出多套方案，先当识别错重试；连续 3 次仍是多套，才按真多解显示。
 """
 
@@ -788,7 +789,8 @@ class Viewer(object):
             pady=6,
             cursor="hand2",
         )
-        self.play_btn.pack(side=tk.LEFT, padx=4, pady=6)
+        if self.on_play is not None:
+            self.play_btn.pack(side=tk.LEFT, padx=4, pady=6)
 
         self.body = tk.Frame(self.root, bg="black")
         self.body.pack(fill=tk.BOTH, expand=True)
@@ -1312,6 +1314,206 @@ def _read_screen_size(adb, serial):
     return sizes[-1]
 
 
+def phone_already_paired():
+    """adb 设备列表里已经有一部在线手机，就不用再配对。"""
+    adb = find_adb()
+    if not adb:
+        return False
+    try:
+        _adb_run(adb, ["start-server"], 20)
+        online, _unauthorized = _adb_devices(adb)
+    except Exception as exc:
+        print("检查 adb 失败: %s" % exc)
+        return False
+    if online:
+        print("已配对: %s" % ", ".join(online))
+    return bool(online)
+
+
+def run_pair(ip, port, code):
+    """执行 adb pair。成功并且手机出现在设备列表里才返回 True。"""
+    adb = find_adb()
+    if not adb:
+        return False, "找不到 adb"
+    try:
+        _adb_run(adb, ["start-server"], 20)
+        code_rc, out, err = _adb_run(adb, ["pair", "%s:%s" % (ip, port), code], 30)
+    except Exception as exc:
+        return False, str(exc)
+    text = "\n".join(part for part in (out, err) if part).strip()
+    lower = text.lower()
+    print(text or "adb pair 没有输出")
+    if code_rc != 0 or "successfully paired" not in lower:
+        if "protocol fault" in lower:
+            return False, "配对没完成。请重新打开手机上的配对窗口，换新的端口和配对码。"
+        if "wrong password" in lower or "connection was dropped" in lower:
+            return False, "配对码不对，或配对窗口已经关掉。请重新打开后再试。"
+        return False, (text or "配对失败")[:80]
+    for _ in range(8):
+        try:
+            online, _unauthorized = _adb_devices(adb)
+        except Exception:
+            online = []
+        if online:
+            print("配对完成: %s" % ", ".join(online))
+            return True, "已配对"
+        time.sleep(0.4)
+    return False, "配对命令成功，但手机还没连上。请看手机是否要点「允许」。"
+
+
+class PairDialog(object):
+    """进游戏画面之前的配对。关掉窗口表示不启动。"""
+
+    def __init__(self, default_ip):
+        self.result = None
+        self.root = tk.Tk()
+        self.root.title("无线调试配对")
+        self.root.resizable(False, False)
+        self.root.configure(bg="#1e2428")
+        self.root.protocol("WM_DELETE_WINDOW", self._quit)
+
+        wrap = tk.Frame(self.root, bg="#1e2428", padx=18, pady=16)
+        wrap.pack()
+        tk.Label(
+            wrap,
+            text="还没有配对。请在手机上打开「无线调试 → 使用配对码配对设备」，\n把窗口里的 IP、端口和配对码填在这里。配对窗口不要关。",
+            bg="#1e2428",
+            fg="white",
+            font=("Microsoft YaHei UI", 10),
+            justify=tk.LEFT,
+        ).grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 12))
+
+        self.ip = tk.StringVar(value=default_ip or "")
+        self.port = tk.StringVar()
+        self.code = tk.StringVar()
+        for row, label, variable in (
+            (1, "IP", self.ip),
+            (2, "端口", self.port),
+            (3, "配对码", self.code),
+        ):
+            tk.Label(
+                wrap,
+                text=label,
+                bg="#1e2428",
+                fg="white",
+                font=("Microsoft YaHei UI", 11),
+            ).grid(row=row, column=0, sticky=tk.W, pady=4, padx=(0, 8))
+            tk.Entry(
+                wrap,
+                textvariable=variable,
+                font=("Microsoft YaHei UI", 11),
+                width=28,
+            ).grid(row=row, column=1, sticky=tk.W, pady=4)
+
+        self.status = tk.Label(
+            wrap,
+            text="",
+            bg="#1e2428",
+            fg="#ffb4b4",
+            font=("Microsoft YaHei UI", 10),
+            wraplength=360,
+            justify=tk.LEFT,
+        )
+        self.status.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(10, 8))
+
+        buttons = tk.Frame(wrap, bg="#1e2428")
+        buttons.grid(row=5, column=0, columnspan=2, sticky=tk.E)
+        self.pair_btn = tk.Button(
+            buttons,
+            text="配对",
+            command=self._pair,
+            font=("Microsoft YaHei UI", 11),
+            bg="#1f8a4c",
+            fg="white",
+            activebackground="#18723e",
+            activeforeground="white",
+            relief=tk.FLAT,
+            padx=14,
+            pady=6,
+            cursor="hand2",
+        )
+        self.pair_btn.pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(
+            buttons,
+            text="只看，不点击",
+            command=self._skip,
+            font=("Microsoft YaHei UI", 11),
+            bg="#3d8bfd",
+            fg="white",
+            activebackground="#2f6fd1",
+            activeforeground="white",
+            relief=tk.FLAT,
+            padx=14,
+            pady=6,
+            cursor="hand2",
+        ).pack(side=tk.LEFT)
+        if not find_adb():
+            self.pair_btn.configure(state=tk.DISABLED)
+            self.status.configure(text="找不到 adb，这次只能只看画面。")
+        self.root.bind("<Return>", lambda _event: self._pair())
+        self.root.update_idletasks()
+        width = self.root.winfo_width()
+        height = self.root.winfo_height()
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        self.root.geometry("+%d+%d" % ((screen_w - width) // 2, (screen_h - height) // 3))
+
+    def run(self):
+        self.root.mainloop()
+        return self.result
+
+    def _quit(self):
+        self.result = None
+        self.root.destroy()
+
+    def _skip(self):
+        self.result = False
+        self.root.destroy()
+
+    def _pair(self):
+        if str(self.pair_btn.cget("state")) == tk.DISABLED:
+            return
+        ip = self.ip.get().strip()
+        port = self.port.get().strip()
+        code = self.code.get().strip()
+        if not ip or not port.isdigit() or not code.isdigit():
+            self.status.configure(text="请填写 IP、端口和配对码，端口和配对码都是数字。")
+            return
+        self.pair_btn.configure(state=tk.DISABLED, text="正在配对…")
+        self.status.configure(text="正在配对，请不要关掉手机上的配对窗口。", fg="#c8c8c8")
+
+        def work():
+            ok, message = run_pair(ip, port, code)
+
+            def apply():
+                try:
+                    if not self.root.winfo_exists():
+                        return
+                except tk.TclError:
+                    return
+                if ok:
+                    self.result = True
+                    self.root.destroy()
+                    return
+                self.status.configure(text=message, fg="#ffb4b4")
+                self.pair_btn.configure(state=tk.NORMAL, text="配对")
+
+            try:
+                self.root.after(0, apply)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=work, name="pair", daemon=True).start()
+
+
+def prepare_click(default_ip):
+    """进游戏前配对。返回 True 允许自动点击，False 只看，None 表示用户关掉了窗口。"""
+    if phone_already_paired():
+        return True
+    print("还没有 adb 配对，先弹出配对窗口")
+    return PairDialog(default_ip).run()
+
+
 def connect_adb(preferred, phone_host):
     """连上已经配对好的 adb。ScreenStream 本身不能把点击送回手机。"""
     adb = find_adb()
@@ -1567,7 +1769,7 @@ def play_loop(state, viewer, page_url, adb_serial):
         viewer.set_play_text("自动点击")
 
 
-def watch(page_url, pin, adb_serial=""):
+def watch(page_url, pin, adb_serial="", allow_click=True):
     prevent_display_sleep()
     state = SharedState()
     stream_thread = threading.Thread(
@@ -1642,7 +1844,7 @@ def watch(page_url, pin, adb_serial=""):
     viewer = Viewer(
         on_rerecognize=state.request_rerecognize,
         on_hint=request_hint,
-        on_play=toggle_play,
+        on_play=toggle_play if allow_click else None,
     )
     blank = paint_status(np.full((640, 360, 3), 32, np.uint8), "正在连接手机…")
     viewer.show(blank)
@@ -1680,7 +1882,14 @@ def main(argv):
     parser.add_argument("--pin", default="", help="ScreenStream 里设置的数字密码")
     parser.add_argument("--adb", default="", help="adb 序列号或 IP:端口，例如 192.168.1.8:5555")
     args = parser.parse_args(argv[1:])
-    watch(args.url, args.pin.strip(), args.adb.strip())
+    host = urlparse(args.url).hostname or ""
+    allow_click = prepare_click(host)
+    if allow_click is None:
+        print("未配对，已退出")
+        return 0
+    if not allow_click:
+        print("未配对，只看画面，不自动点击")
+    watch(args.url, args.pin.strip(), args.adb.strip(), allow_click)
     return 0
 
 
