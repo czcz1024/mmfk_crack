@@ -1518,10 +1518,12 @@ def play_loop(state, viewer, page_url, adb_serial):
             tx, ty, device_w, device_h = cell_center_tap(frame.shape, box, screen)
             state.set_note("正在点 %d/%d" % (len(confirmed) + 1, n))
             print(
-                "点击第 %d 行第 %d 列，画面 %dx%d → 手机 (%d,%d)，屏幕 %dx%d"
+                "双击第 %d 行第 %d 列，画面 %dx%d → 手机 (%d,%d)，屏幕 %dx%d"
                 % (row + 1, col + 1, frame.shape[1], frame.shape[0], tx, ty, device_w, device_h)
             )
-            code, out, err = _adb_run(adb, ["-s", serial, "shell", "input", "tap", str(tx), str(ty)], 8)
+            # 单击会被游戏标成「不是猫」。两次点击放在同一次 shell 里，间隔才算双击。
+            tap = "input tap %d %d; sleep 0.12; input tap %d %d" % (tx, ty, tx, ty)
+            code, out, err = _adb_run(adb, ["-s", serial, "shell", tap], 8)
             if code != 0:
                 detail = (err or out or "点击失败")[:40]
                 print("adb tap 失败: %s" % detail)
