@@ -989,6 +989,49 @@ def _status_with_note(state, n, solutions, marked):
     return title
 
 
+def _cell_center(box):
+    x, y, w, h = box
+    return x + w / 2.0, y + h / 2.0
+
+
+def _boards_aligned(old, new):
+    """已锁定的格子和新探测到的格子是不是同一套位置。
+
+    选对动画会让切格错开大约一格。这种结果不能拿来挪标注。
+    只是整盘轻轻动了几个像素时，仍然跟过去。
+    """
+    if not old or not new or len(old) != len(new):
+        return False
+    n = len(old)
+    if n <= 0:
+        return False
+    if any(len(row) != n for row in old) or any(len(row) != n for row in new):
+        return False
+    side = min(float(old[0][0][2]), float(old[0][0][3]))
+    if side <= 1:
+        return False
+    limit = side * 0.45
+    points = [(0, 0), (0, n - 1), (n - 1, 0), (n - 1, n - 1), (n // 2, n // 2)]
+    offsets = []
+    for row, col in points:
+        nx, ny = _cell_center(new[row][col])
+        best = None
+        best_d = None
+        for rr in range(n):
+            for cc in range(n):
+                ox, oy = _cell_center(old[rr][cc])
+                dist = (nx - ox) ** 2 + (ny - oy) ** 2
+                if best_d is None or dist < best_d:
+                    best_d = dist
+                    best = (rr - row, cc - col)
+        if best is None or best_d > limit * limit:
+            return False
+        offsets.append(best)
+    if len(set(offsets)) != 1:
+        return False
+    return offsets[0] == (0, 0)
+
+
 def _keep_locked(state, bag, marked=None):
     if marked is not None:
         bag["marked"] = marked or bag.get("marked")
@@ -1038,17 +1081,13 @@ def recognize_loop(state):
         if frame is None:
             continue
 
-        # 过关动画：不当新局；记下「刚过关」，动画结束后空白新盘再放下旧解。
+        # 过关后立刻拿掉猫的标注。旧解先留在 bag 里，空白新盘出现再放下并重新解密。
         if is_celebration_screen(frame):
             bag["miss_streak"] = 0
-            if bag["solutions"] is not None:
-                bag["saw_celebration"] = True
-                state.set_status(
-                    _title(bag["n"], bag["solutions"], bag.get("marked"))
-                    + "（过关动画）"
-                )
-            else:
-                state.clear_result("过关动画…")
+            if not bag.get("saw_celebration"):
+                print("过关了，先去掉标注，等下一局再解密")
+            bag["saw_celebration"] = True
+            state.clear_result("过关了，等待下一局…")
             continue
 
         try:
@@ -1091,6 +1130,10 @@ def recognize_loop(state):
             _clear_bag(bag)
             state.clear_result("识别新的一局…")
             # bag 已空，下面按新局走
+        elif not force and bag["solutions"] is not None and bag.get("saw_celebration"):
+            # 过关后的残局或过渡画面，不要把上一局的猫标回去。
+            state.clear_result("过关了，等待下一局…")
+            continue
 
         # 本局已锁定解：局中粘住；空白新盘才换局。
         if not force and bag["solutions"] is not None:
@@ -1099,9 +1142,10 @@ def recognize_loop(state):
                 bag["mismatch_n"] = None
                 same = same_board_colors(samples, n, bag["samples"], bag["n"])
                 if same or marked:
-                    bag["board"] = peek["board"]
-                    if same:
-                        bag["samples"] = samples
+                    if _boards_aligned(bag["board"], peek["board"]):
+                        bag["board"] = peek["board"]
+                        if same:
+                            bag["samples"] = samples
                     _keep_locked(state, bag, marked=marked)
                     continue
                 # 同尺寸、无标记、颜色明显变了 → 新开局
